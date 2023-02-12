@@ -41,7 +41,7 @@ COPY docker-entrypoint.sh ./
 # hadolint ignore=DL3013
 RUN \
     pip3 install -U pip && \
-    pip3 install --no-cache-dir python-matter-server==${MATTER_SERVER_VERSION}
+    pip3 install --no-cache-dir python-matter-server[server]==${MATTER_SERVER_VERSION}
 
 VOLUME ["/data"]
 EXPOSE 5580
