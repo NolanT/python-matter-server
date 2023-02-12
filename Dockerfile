@@ -3,7 +3,7 @@ FROM debian:bullseye
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG MATTER_SERVER_VERSION=1.1.0
+ARG MATTER_SERVER_VERSION=2.0.2
 
 WORKDIR /app
 
@@ -41,7 +41,7 @@ COPY docker-entrypoint.sh ./
 # hadolint ignore=DL3013
 RUN \
     pip3 install -U pip && \
-    pip3 install --no-cache-dir python-matter-server[server]=${MATTER_SERVER_VERSION}
+    pip3 install --no-cache-dir python-matter-server==${MATTER_SERVER_VERSION}
 
 VOLUME ["/data"]
 EXPOSE 5580
