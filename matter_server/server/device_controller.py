@@ -7,26 +7,33 @@ from collections import deque
 from datetime import datetime
 from functools import partial
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Deque, Optional, Type, TypeVar, cast
+import time
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Deque, Type, TypeVar, cast
 
 from chip.ChipDeviceCtrl import CommissionableNode
-from chip.clusters import Attribute, ClusterCommand
+from chip.clusters import Attribute, Objects as Clusters
+from chip.clusters.ClusterObjects import ALL_CLUSTERS, Cluster
 from chip.exceptions import ChipStackError
 
-from ..common.helpers.api import api_command
-from ..common.helpers.util import dataclass_from_dict
-from ..common.models.api_command import APICommand
-from ..common.models.error import (
+from ..common.const import SCHEMA_VERSION
+from ..common.errors import (
     NodeCommissionFailed,
     NodeInterviewFailed,
     NodeNotExists,
     NodeNotResolving,
 )
-from ..common.models.events import EventType
-from ..common.models.node import MatterAttribute, MatterNode
-from .const import SCHEMA_VERSION
+from ..common.helpers.api import api_command
+from ..common.helpers.util import (
+    create_attribute_path,
+    create_attribute_path_from_attribute,
+    dataclass_from_dict,
+)
+from ..common.models import APICommand, EventType, MatterNodeData
+from .const import PAA_ROOT_CERTS_DIR
+from .helpers.paa_certificates import fetch_certificates
 
 if TYPE_CHECKING:
+    from chip.ChipDeviceCtrl import ChipDeviceController
 
     from .server import MatterServer
 
@@ -36,10 +43,13 @@ DATA_KEY_NODES = "nodes"
 DATA_KEY_LAST_NODE_ID = "last_node_id"
 
 LOGGER = logging.getLogger(__name__)
+INTERVIEW_TASK_LIMIT = 10
 
 
 class MatterDeviceController:
     """Class that manages the Matter devices."""
+
+    chip_controller: ChipDeviceController | None
 
     def __init__(
         self,
@@ -47,23 +57,24 @@ class MatterDeviceController:
     ):
         """Initialize the device controller."""
         self.server = server
-        # Instantiate the underlying ChipDeviceController instance on the Fabric
-        self.chip_controller = server.stack.fabric_admin.NewController()
         # we keep the last events in memory so we can include them in the diagnostics dump
         self.event_history: Deque[Attribute.EventReadResult] = deque(maxlen=25)
         self._subscriptions: dict[int, Attribute.SubscriptionTransaction] = {}
-        self._nodes: dict[int, MatterNode] = {}
+        self._nodes: dict[int, MatterNodeData | None] = {}
         self.wifi_credentials_set: bool = False
         self.thread_credentials_set: bool = False
         self.compressed_fabric_id: int | None = None
-
-    @property
-    def fabric_id(self) -> int:
-        """Return Fabric ID."""
-        return cast(int, self.chip_controller.fabricId)
+        self._interview_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         """Async initialize of controller."""
+        # (re)fetch all PAA certificates once at startup
+        # NOTE: this must be done before initializing the controller
+        await fetch_certificates()
+        # Instantiate the underlying ChipDeviceController instance on the Fabric
+        self.chip_controller = self.server.stack.fabric_admin.NewController(
+            paaTrustStorePath=str(PAA_ROOT_CERTS_DIR)
+        )
         self.compressed_fabric_id = await self._call_sdk(
             self.chip_controller.GetCompressedFabricId
         )
@@ -72,22 +83,30 @@ class MatterDeviceController:
     async def start(self) -> None:
         """Handle logic on controller start."""
         # load nodes from persistent storage
-        nodes_data = self.server.storage.get(DATA_KEY_NODES, {})
-        for node_id_str, node_dict in nodes_data.items():
+        nodes: dict[str, dict] = self.server.storage.get(DATA_KEY_NODES, {})
+        for node_id_str, node_dict in nodes.items():
             node_id = int(node_id_str)
-            node = dataclass_from_dict(MatterNode, node_dict)
+            # invalidate node data if schema mismatch,
+            # the node will automatically be scheduled for re-interview
+            if node_dict and node_dict.get("interview_version") != SCHEMA_VERSION:
+                node = None
+            else:
+                node = dataclass_from_dict(MatterNodeData, node_dict)
+                # always mark node as unavailable at startup until subscriptions are ready
+                node.available = False
             self._nodes[node_id] = node
-            # make sure to start node subscriptions
-            try:
-                await self.subscribe_node(node_id)
-            except NodeNotResolving:
-                LOGGER.warning("Node %s is not resolving, skipping...", node_id)
-        # create task to check for nodes that need any re(interviews)
-        self._schedule_interviews()
+        # setup subscriptions and (re)interviews as task in the background
+        # as we do not want it to block our startup
+        self._interview_task = asyncio.create_task(
+            self._check_subscriptions_and_interviews()
+        )
         LOGGER.debug("Loaded %s nodes", len(self._nodes))
 
     async def stop(self) -> None:
         """Handle logic on server stop."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         # unsubscribe all node subscriptions
         for sub in self._subscriptions.values():
             await self._call_sdk(sub.Shutdown)
@@ -96,24 +115,34 @@ class MatterDeviceController:
         LOGGER.debug("Stopped.")
 
     @api_command(APICommand.GET_NODES)
-    def get_nodes(self) -> list[MatterNode]:
+    def get_nodes(self, only_available: bool = False) -> list[MatterNodeData]:
         """Return all Nodes known to the server."""
-        return [x for x in self._nodes.values() if x is not None]
+        return [
+            x
+            for x in self._nodes.values()
+            if x is not None and (x.available or not only_available)
+        ]
 
     @api_command(APICommand.GET_NODE)
-    def get_node(self, node_id: int) -> MatterNode:
+    def get_node(self, node_id: int) -> MatterNodeData:
         """Return info of a single Node."""
         node = self._nodes.get(node_id)
         assert node is not None, "Node does not exist or is not yet interviewed"
         return node
 
     @api_command(APICommand.COMMISSION_WITH_CODE)
-    async def commission_with_code(self, code: str) -> MatterNode:
+    async def commission_with_code(self, code: str) -> MatterNodeData:
         """
         Commission a device using QRCode or ManualPairingCode.
 
         Returns full NodeInfo once complete.
         """
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
+        # perform a quick delta sync of certificates to make sure
+        # we have the latest paa root certs
+        await fetch_certificates()
         node_id = self._get_next_node_id()
 
         success = await self._call_sdk(
@@ -139,7 +168,7 @@ class MatterDeviceController:
         setup_pin_code: int,
         filter_type: int = 0,
         filter: Any = None,  # pylint: disable=redefined-builtin
-    ) -> MatterNode:
+    ) -> MatterNodeData:
         """
         Commission a device already connected to the network.
 
@@ -148,6 +177,15 @@ class MatterDeviceController:
         a string or None depending on the actual type of selected filter.
         Returns full NodeInfo once complete.
         """
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
+        # perform a quick delta sync of certificates to make sure
+        # we have the latest paa root certs
+        # NOTE: Its not very clear if the newly fetched certificates can be used without
+        # restarting the device controller
+        await fetch_certificates()
+
         node_id = self._get_next_node_id()
 
         success = await self._call_sdk(
@@ -172,6 +210,9 @@ class MatterDeviceController:
     @api_command(APICommand.SET_WIFI_CREDENTIALS)
     async def set_wifi_credentials(self, ssid: str, credentials: str) -> None:
         """Set WiFi credentials for commissioning to a (new) device."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         await self._call_sdk(
             self.chip_controller.SetWiFiCredentials,
             ssid=ssid,
@@ -183,6 +224,9 @@ class MatterDeviceController:
     @api_command(APICommand.SET_THREAD_DATASET)
     async def set_thread_operational_dataset(self, dataset: str) -> None:
         """Set Thread Operational dataset in the stack."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         await self._call_sdk(
             self.chip_controller.SetThreadOperationalDataset,
             threadOperationalDataset=bytes.fromhex(dataset),
@@ -197,13 +241,16 @@ class MatterDeviceController:
         timeout: int = 300,
         iteration: int = 1000,
         option: int = 0,
-        discriminator: Optional[int] = None,
+        discriminator: int | None = None,
     ) -> int:
         """
         Open a commissioning window to commission a device present on this controller to another.
 
         Returns code to use as discriminator.
         """
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         if discriminator is None:
             discriminator = 3840  # TODO generate random one
 
@@ -222,6 +269,8 @@ class MatterDeviceController:
         self,
     ) -> CommissionableNode | list[CommissionableNode] | None:
         """Discover Commissionable Nodes (discovered on BLE or mDNS)."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
 
         result = await self._call_sdk(
             self.chip_controller.DiscoverCommissionableNodes,
@@ -231,19 +280,23 @@ class MatterDeviceController:
     @api_command(APICommand.INTERVIEW_NODE)
     async def interview_node(self, node_id: int) -> None:
         """Interview a node."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         LOGGER.debug("Interviewing node: %s", node_id)
         try:
             await self._call_sdk(self.chip_controller.ResolveNode, nodeid=node_id)
             read_response: Attribute.AsyncReadTransaction.ReadResponse = (
                 await self.chip_controller.Read(
-                    nodeid=node_id, attributes="*", events="*"
+                    nodeid=node_id, attributes="*", events="*", fabricFiltered=False
                 )
             )
         except ChipStackError as err:
             raise NodeInterviewFailed(f"Failed to interview node {node_id}") from err
 
+        is_new_node = node_id not in self._nodes
         existing_info = self._nodes.get(node_id)
-        node = MatterNode(
+        node = MatterNodeData(
             node_id=node_id,
             date_commissioned=existing_info.date_commissioned
             if existing_info
@@ -251,7 +304,7 @@ class MatterDeviceController:
             last_interview=datetime.utcnow(),
             interview_version=SCHEMA_VERSION,
             attributes=self._parse_attributes_from_read_result(
-                node_id, read_response.attributes
+                read_response.attributes
             ),
         )
 
@@ -263,35 +316,77 @@ class MatterDeviceController:
             value=node,
             force=not existing_info,
         )
-        if existing_info is None:
+        if is_new_node:
             # new node - first interview
             self.server.signal_event(EventType.NODE_ADDED, node)
+        else:
+            # existing node, signal node updated event
+            self.server.signal_event(EventType.NODE_UPDATED, node)
 
         LOGGER.debug("Interview of node %s completed", node_id)
 
     @api_command(APICommand.DEVICE_COMMAND)
     async def send_device_command(
-        self, node_id: int, endpoint: int, payload: ClusterCommand
+        self,
+        node_id: int,
+        endpoint_id: int,
+        cluster_id: int,
+        command_name: str,
+        payload: dict,
+        response_type: Any | None = None,
+        timed_request_timeout_ms: int | None = None,
+        interaction_timeout_ms: int | None = None,
     ) -> Any:
         """Send a command to a Matter node/device."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
+        cluster_cls: Cluster = ALL_CLUSTERS[cluster_id]
+        command_cls = getattr(cluster_cls.Commands, command_name)
+        command = dataclass_from_dict(command_cls, payload)
         return await self.chip_controller.SendCommand(
-            nodeid=node_id, endpoint=endpoint, payload=payload
+            nodeid=node_id,
+            endpoint=endpoint_id,
+            payload=command,
+            responseType=response_type,
+            timedRequestTimeoutMs=timed_request_timeout_ms,
+            interactionTimeoutMs=interaction_timeout_ms,
         )
 
     @api_command(APICommand.REMOVE_NODE)
     async def remove_node(self, node_id: int) -> None:
         """Remove a Matter node/device from the fabric."""
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         if node_id not in self._nodes:
             raise NodeNotExists(
                 f"Node {node_id} does not exist or has not been interviewed."
             )
-        self._nodes.pop(node_id)
+
+        node = self._nodes.pop(node_id)
         self.server.storage.remove(
             DATA_KEY_NODES,
             subkey=str(node_id),
         )
-        # TODO: Is there functionality to actually reset the device ?
+
+        assert node is not None
+
+        attribute_path = create_attribute_path_from_attribute(
+            0,
+            Clusters.OperationalCredentials.Attributes.CurrentFabricIndex,
+        )
+        fabric_index = node.attributes[attribute_path]
+
         self.server.signal_event(EventType.NODE_DELETED, node_id)
+
+        await self.chip_controller.SendCommand(
+            nodeid=node_id,
+            endpoint=0,
+            payload=Clusters.OperationalCredentials.Commands.RemoveFabric(
+                fabricIndex=fabric_index,
+            ),
+        )
 
     async def subscribe_node(self, node_id: int) -> None:
         """
@@ -299,24 +394,36 @@ class MatterDeviceController:
 
         Note that by using the listen command at server level, you will receive all node events.
         """
+        if self.chip_controller is None:
+            raise RuntimeError("Device Controller not initialized.")
+
         if node_id not in self._nodes:
             raise NodeNotExists(
                 f"Node {node_id} does not exist or has not been interviewed."
             )
         assert node_id not in self._subscriptions, "Already subscribed to node"
-        LOGGER.debug("Setup subscription for node %s", node_id)
+        node_logger = LOGGER.getChild(str(node_id))
+        node_logger.debug("Setting up subscriptions...")
+
+        node = cast(MatterNodeData, self._nodes[node_id])
 
         try:
             await self._call_sdk(self.chip_controller.ResolveNode, nodeid=node_id)
         except ChipStackError as err:
+            node.available = False
             raise NodeNotResolving(f"Failed to resolve node {node_id}") from err
+
         # we follow the pattern of apple and google here and
         # just do a wildcard subscription for all clusters and properties
         # the client will handle filtering of the events.
         # if it turns out in the future that this is too much traffic (I don't think so now)
         # we can revisit this choice and do some selected subscriptions.
         sub: Attribute.SubscriptionTransaction = await self.chip_controller.Read(
-            nodeid=node_id, attributes="*", events="*", reportInterval=(0, 10)
+            nodeid=node_id,
+            attributes="*",
+            events=[("*", 0)],
+            reportInterval=(0, 120),
+            fabricFiltered=False,
         )
 
         def attribute_updated_callback(
@@ -325,10 +432,9 @@ class MatterDeviceController:
         ) -> None:
             assert self.server.loop is not None
             new_value = transaction.GetAttribute(path)
-            LOGGER.debug("attribute updated -- %s - new value: %s", path, new_value)
-            node = self._nodes[node_id]
-            attr = node.attributes[str(path.Path)]
-            attr.value = new_value
+            node_logger.debug("Attribute updated: %s - new value: %s", path, new_value)
+            attr_path = str(path.Path)
+            node.attributes[attr_path] = new_value
 
             # schedule save to persistent storage
             self.server.storage.set(
@@ -339,7 +445,10 @@ class MatterDeviceController:
 
             # This callback is running in the CHIP stack thread
             self.server.loop.call_soon_threadsafe(
-                self.server.signal_event, EventType.ATTRIBUTE_UPDATED, attr
+                self.server.signal_event,
+                EventType.ATTRIBUTE_UPDATED,
+                # send data as tuple[node_id, attribute_path, new_value]
+                (node_id, attr_path, new_value),
             )
 
         def event_callback(
@@ -348,7 +457,7 @@ class MatterDeviceController:
         ) -> None:
             # pylint: disable=unused-argument
             assert self.server.loop is not None
-            LOGGER.debug("received node event: %s", data)
+            node_logger.debug("Received node event: %s", data)
             self.event_history.append(data)
             # TODO: This callback does not seem to fire ever or my test devices do not have events
             self.server.loop.call_soon_threadsafe(
@@ -359,7 +468,7 @@ class MatterDeviceController:
             chipError: int, transaction: Attribute.SubscriptionTransaction
         ) -> None:
             # pylint: disable=unused-argument, invalid-name
-            LOGGER.error("Got error from node: %s", chipError)
+            node_logger.error("Got error from node: %s", chipError)
 
         def resubscription_attempted(
             transaction: Attribute.SubscriptionTransaction,
@@ -367,19 +476,25 @@ class MatterDeviceController:
             nextResubscribeIntervalMsec: int,
         ) -> None:
             # pylint: disable=unused-argument, invalid-name
-            LOGGER.debug(
-                "Previous subscription failed with Error: %s - re-subscribing in %s ms...",
+            node_logger.debug(
+                "Previous subscription failed with Error: %s, re-subscribing in %s ms...",
                 terminationError,
                 nextResubscribeIntervalMsec,
             )
-            # TODO: update node status to unavailable
+            # mark node as unavailable and signal consumers
+            if node.available:
+                node.available = False
+                self.server.signal_event(EventType.NODE_UPDATED, node)
 
         def resubscription_succeeded(
             transaction: Attribute.SubscriptionTransaction,
         ) -> None:
             # pylint: disable=unused-argument, invalid-name
-            LOGGER.debug("Subscription succeeded")
-            # TODO: update node status to available
+            node_logger.debug("Re-Subscription succeeded")
+            # mark node as available and signal consumers
+            if not node.available:
+                node.available = True
+                self.server.signal_event(EventType.NODE_UPDATED, node)
 
         sub.SetAttributeUpdateCallback(attribute_updated_callback)
         sub.SetEventUpdateCallback(event_callback)
@@ -387,6 +502,11 @@ class MatterDeviceController:
         sub.SetResubscriptionAttemptedCallback(resubscription_attempted)
         sub.SetResubscriptionSucceededCallback(resubscription_succeeded)
         self._subscriptions[node_id] = sub
+        # if we reach this point, it means the node could be resolved
+        # and the initial subscription succeeded, mark the node available.
+        node.available = True
+        node_logger.debug("Subscription succeeded")
+        self.server.signal_event(EventType.NODE_UPDATED, node)
 
     def _get_next_node_id(self) -> int:
         """Return next node_id."""
@@ -407,47 +527,108 @@ class MatterDeviceController:
             ),
         )
 
-    async def _check_interviews(self) -> None:
-        """Check if any nodes need to be (re)interviewed."""
-        assert self.server.loop is not None
-        # Reinterview all nodes that have an outdated schema
-        # and/or have been interviewed more than 30 days ago.
-        for node in self._nodes.values():
+    async def _check_subscriptions_and_interviews(self) -> None:
+        """Run subscriptions (and interviews) for known nodes."""
+        # Set default resubscribe interval to 1 hour
+        reschedule_interval = 3600
+        start_time = time.time()
+        tasks: list[Coroutine[Any, Any, None]] = []
+        task_limit: asyncio.Semaphore = asyncio.Semaphore(INTERVIEW_TASK_LIMIT)
+
+        for node_id, node in self._nodes.items():
+            # (re)interview node (only) if needed
             if (
-                SCHEMA_VERSION > node.interview_version
+                node is None
+                or node.interview_version < SCHEMA_VERSION
                 or (datetime.utcnow() - node.last_interview).days > 30
             ):
-                await self.interview_node(node.node_id)
-        # reschedule self to run every hour
-        self.server.loop.call_later(3600, self._schedule_interviews)
 
-    def _schedule_interviews(self) -> None:
-        """Schedule interviews."""
-        asyncio.create_task(self._check_interviews())
+                async def _interview_node(node_id: int) -> None:
+                    """Run interview for node."""
+                    try:
+                        await self.interview_node(node_id)
+                    except NodeInterviewFailed as err:
+                        LOGGER.warning(
+                            "Unable to interview Node %s, we will retry later in the background.",
+                            node_id,
+                            exc_info=err,
+                        )
+                        raise err
+
+                tasks.append(_interview_node(node_id))
+                continue
+
+            # setup subscriptions for the node
+            if node_id in self._subscriptions:
+                continue
+
+            async def _subscribe_node(node_id: int) -> None:
+                """Subscribe to node events."""
+                try:
+                    await self.subscribe_node(node_id)
+                except NodeNotResolving as err:
+                    LOGGER.warning(
+                        "Unable to subscribe to Node %s, "
+                        "we will retry later in the background.",
+                        node_id,
+                        exc_info=err,
+                    )
+                    raise err
+
+            tasks.append(_subscribe_node(node_id))
+
+        async def _run_task(task: Coroutine[Any, Any, None]) -> None:
+            """Run coroutine and release semaphore."""
+            async with task_limit:
+                await task
+
+        LOGGER.debug("Running %s tasks", len(tasks))
+        # wait for all tasks to finish
+        results: list[Exception | None] = await asyncio.gather(
+            *(_run_task(task) for task in tasks), return_exceptions=True
+        )
+        LOGGER.debug(
+            "Done running %s tasks in %s seconds",
+            len(results),
+            start_time - time.time(),
+        )
+        # check if any of the tasks failed
+        for result in results:
+            if isinstance(result, Exception):
+                # if any of the tasks failed, reschedule in 5 minutes
+                reschedule_interval = 300
+                break
+
+        # reschedule self to run every hour
+        def _schedule() -> None:
+            """Schedule task."""
+            self._interview_task = asyncio.create_task(
+                self._check_subscriptions_and_interviews()
+            )
+
+        LOGGER.debug("Rescheduling interviews in %s seconds", reschedule_interval)
+        loop = cast(asyncio.AbstractEventLoop, self.server.loop)
+        loop.call_later(reschedule_interval, _schedule)
 
     @staticmethod
     def _parse_attributes_from_read_result(
-        node_id: int, attributes: dict[int, dict[Type, dict[Type, Any]]]
-    ) -> dict[str, MatterAttribute]:
+        read_result: dict[int, dict[Type, dict[Type, Any]]]
+    ) -> dict[str, Any]:
         """Parse attributes from ReadResult."""
         result = {}
-        for endpoint, cluster_dict in attributes.items():
-            # read result output is in format {endpoint: {ClusterClass: {AttributeClass: value}}}
-            # we parse this to our own much more useable format
+        for endpoint, cluster_dict in read_result.items():
+            # read result output is in format
+            # {endpoint: {ClusterClass: {AttributeClass: value}}}
             for cluster_cls, attr_dict in cluster_dict.items():
                 for attr_cls, attr_value in attr_dict.items():
                     if attr_cls == Attribute.DataVersion:
                         continue
-                    attr = MatterAttribute(
-                        node_id=node_id,
-                        endpoint=endpoint,
-                        cluster_id=cluster_cls.id,
-                        cluster_type=cluster_cls,
-                        cluster_name=cluster_cls.__name__,
-                        attribute_id=attr_cls.attribute_id,
-                        attribute_type=attr_cls,
-                        attribute_name=attr_cls.__name__,
-                        value=attr_value,
+                    # we are only interested in the raw values and let the client
+                    # match back from the id's to the correct cluster/attribute classes
+                    # attributes are stored in form of AttributePath:
+                    # ENDPOINT/CLUSTER_ID/ATTRIBUTE_ID
+                    attribute_path = create_attribute_path(
+                        endpoint, cluster_cls.id, attr_cls.attribute_id
                     )
-                    result[attr.path] = attr
+                    result[attribute_path] = attr_value
         return result

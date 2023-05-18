@@ -8,19 +8,24 @@ import weakref
 
 from aiohttp import web
 
-from matter_server.common.models.error import VersionMismatch
-from matter_server.server.const import SCHEMA_VERSION
-
+from ..common.const import SCHEMA_VERSION
+from ..common.errors import VersionMismatch
 from ..common.helpers.api import APICommandHandler, api_command
 from ..common.helpers.json import json_dumps
 from ..common.helpers.util import chip_clusters_version, chip_core_version
-from ..common.models.api_command import APICommand
-from ..common.models.events import EventCallBackType, EventType
-from ..common.models.server_information import ServerDiagnostics, ServerInfo
+from ..common.models import (
+    APICommand,
+    EventCallBackType,
+    EventType,
+    ServerDiagnostics,
+    ServerInfoMessage,
+)
 from ..server.client_handler import WebsocketClientHandler
+from .const import MIN_SCHEMA_VERSION
 from .device_controller import MatterDeviceController
 from .stack import MatterStack
 from .storage import StorageController
+from .vendor_info import VendorInfo
 
 
 def mount_websocket(server: MatterServer, path: str) -> None:
@@ -71,6 +76,7 @@ class MatterServer:
         # of Matter devices and their subscriptions.
         self.device_controller = MatterDeviceController(self)
         self.storage = StorageController(self)
+        self.vendor_info = VendorInfo(self)
         # we dynamically register command handlers
         self.command_handlers: dict[str, APICommandHandler] = {}
         self._subscribers: Set[EventCallBackType] = set()
@@ -88,6 +94,7 @@ class MatterServer:
         await self.device_controller.initialize()
         await self.storage.start()
         await self.device_controller.start()
+        await self.vendor_info.start()
         mount_websocket(self, "/ws")
         self.app.router.add_route("GET", "/", self._handle_info)
         self._runner = web.AppRunner(self.app, access_log=None)
@@ -129,13 +136,14 @@ class MatterServer:
         return unsub
 
     @api_command(APICommand.SERVER_INFO)
-    def get_info(self) -> ServerInfo:
+    def get_info(self) -> ServerInfoMessage:
         """Return (version)info of the Matter Server."""
         assert self.device_controller.compressed_fabric_id is not None
-        return ServerInfo(
-            fabric_id=self.device_controller.fabric_id,
+        return ServerInfoMessage(
+            fabric_id=self.fabric_id,
             compressed_fabric_id=self.device_controller.compressed_fabric_id,
             schema_version=SCHEMA_VERSION,
+            min_supported_schema_version=MIN_SCHEMA_VERSION,
             sdk_version=chip_clusters_version(),
             wifi_credentials_set=self.device_controller.wifi_credentials_set,
             thread_credentials_set=self.device_controller.thread_credentials_set,
@@ -169,12 +177,15 @@ class MatterServer:
 
     def _register_api_commands(self) -> None:
         """Register all methods decorated as api_command."""
-        for cls in (self, self.stack, self.device_controller):
+        for cls in (self, self.device_controller, self.vendor_info):
             for attr_name in dir(cls):
                 if attr_name.startswith("__"):
                     continue
                 val = getattr(cls, attr_name)
                 if not hasattr(val, "api_cmd"):
+                    continue
+                if hasattr(val, "mock_calls"):
+                    # filter out mocks
                     continue
                 # method is decorated with our api decorator
                 self.register_api_command(val.api_cmd, val)

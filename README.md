@@ -39,7 +39,7 @@ The server runs a Matter Controller and includes all logic for storing node info
 
 ### Test devices
 
-Now that the Matter Specification is offically released in its 1.0 version, devices will be available in stores from 2023 that actually have Matter support or least manufacturers run a beta program which you can join to run Matter firmware on your device. Please refer to the documentation of your device if its already Matter enabled out of the box or you need to enable some special firmware(mode).
+Now that the Matter Specification is officially released in its 1.0 version, devices will be available in stores from 2023 that actually have Matter support or least manufacturers run a beta program which you can join to run Matter firmware on your device. Please refer to the documentation of your device if its already Matter enabled out of the box or you need to enable some special firmware(mode).
 
 Besides that it is possible to run Matter firmware on common microcontrollers such as the ESP32 and there is even a whole device emulator available which runs on a regular desktop OS. To make things easier we've prepared a [special page](https://nabucasa.github.io/matter-example-apps) where you can quickly try out running the Matter example apps on ESP32.
 
@@ -55,8 +55,8 @@ Inform the controller about the WiFi credentials it needs to send when commissio
     "message_id": "1",
     "command": "set_wifi_credentials",
     "args": {
-      "ssid": "blah",
-      "credentials": "bah"
+      "ssid": "wifi-name-here",
+      "credentials": "wifi-password-here"
     }
   }
 ```
@@ -69,14 +69,14 @@ Inform the controller about the Thread credentials it needs to use when commissi
     "message_id": "1",
     "command": "set_thread_dataset",
     "args": {
-      "dataset": "blah"
+      "dataset": "put-credentials-here"
     }
   }
 ```
 
 **Commission with code**
 Commission a new device. For WiFi or Thread based devices, the credentials need to be set upfront, otherwise commisisoning will fail.
-The controller will use bluetooth for the commissioning of wireless devices. If the machine running the Python Matter Server controller lacks bluetooth support, comissioning will only work for devices already connected to the network (by cable or another controller).
+The controller will use bluetooth for the commissioning of wireless devices. If the machine running the Python Matter Server controller lacks bluetooth support, commissioning will only work for devices already connected to the network (by cable or another controller).
 
 ```
   {
@@ -131,7 +131,7 @@ Get info of a single Node.
 ```
   {
     "message_id": "2",
-    "command": "get_nodes",
+    "command": "get_node",
     "args": {
       "node_id": 1
     }
@@ -147,6 +147,39 @@ When the start_listening command is issued, the server will dump all existing no
     "command": "start_listening"
   }
 ```
+
+
+**Send a command**
+Because we use the datamodels of the Matter SDK, this is a little bit more involved. Here is an example of turning on a switch.
+
+```
+# Import the CHIP clusters
+from chip.clusters import Objects as clusters
+
+# Import the ability to turn objects into dictionaries, and vice-versa
+from matter_server.common.helpers.util import dataclass_from_dict,dataclass_to_dict
+
+command = clusters.OnOff.Commands.On()
+payload = dataclass_to_dict(command)
+  {
+    "message_id": "device_command",
+    "command": "device_command",
+    "args": {
+      "endpoint": int(self.attribute['endpoint']),
+      "node_id": int(self.attribute['node_id']),
+      "payload": payload
+    }
+  }
+```
+
+You can also provide parameters for the cluster commands. Here's how to change the brightness for example:
+```
+command = clusters.LevelControl.Commands.MoveToLevelWithOnOff(
+  level=int(value), # provide a percentage
+  transitionTime=0, # in seconds
+)
+```
+
 
 ## Development
 
@@ -165,12 +198,12 @@ Please note that development is only possible on Linux and MacOS, no Windows sup
 ### Build
 
 ```sh
-docker-compose build --no-cache matter-server
+docker compose build --no-cache
 ```
 
 ### Run
 
 ```sh
-docker-compose up -d matter-server
-docker-compose logs -f matter-server
+docker compose up -d
+docker compose logs -f
 ```

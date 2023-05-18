@@ -8,13 +8,19 @@ from typing import Any, Callable, Dict, Final, cast
 
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType, client_exceptions
 
+from matter_server.common.helpers.util import dataclass_from_dict
+
+from ..common.const import SCHEMA_VERSION
 from ..common.helpers.json import json_dumps, json_loads
-from ..common.helpers.util import chip_clusters_version, parse_message
-from ..common.models.events import EventType
-from ..common.models.message import CommandMessage, MessageType, ServerInfoMessage
-from ..common.models.node import MatterNode
-from ..common.models.server_information import ServerInfo
-from .const import MIN_SCHEMA_VERSION
+from ..common.models import (
+    CommandMessage,
+    ErrorResultMessage,
+    EventMessage,
+    EventType,
+    MessageType,
+    ServerInfoMessage,
+    SuccessResultMessage,
+)
 from .exceptions import (
     CannotConnect,
     ConnectionClosed,
@@ -24,6 +30,7 @@ from .exceptions import (
     InvalidState,
     NotConnected,
 )
+from .models.node import MatterNode
 
 LOGGER = logging.getLogger(f"{__package__}.connection")
 SUB_WILDCARD: Final = "*"
@@ -40,7 +47,7 @@ class MatterClientConnection:
         """Initialize the Client class."""
         self.ws_server_url = ws_server_url
         # server info is retrieved on connect
-        self.server_info: ServerInfo | None = None
+        self.server_info: ServerInfoMessage | None = None
         self._aiohttp_session = aiohttp_session
         self._ws_client: ClientWebSocketResponse | None = None
         self._nodes: Dict[int, MatterNode] = {}
@@ -75,31 +82,14 @@ class MatterClientConnection:
         info = cast(ServerInfoMessage, await self.receive_message_or_raise())
         self.server_info = info
 
-        # sdk version must match exactly
-        if info.sdk_version != chip_clusters_version():
-            await self._ws_client.close()
-            raise InvalidServerVersion(
-                f"Matter Server SDK version is incompatible: {info.sdk_version} "
-                f"version on the client is {chip_clusters_version()} "
-            )
-
         # basic check for server schema version compatibility
-        if info.schema_version < MIN_SCHEMA_VERSION:
-            # server version is too low, raise exception
+        if info.min_supported_schema_version > SCHEMA_VERSION:
+            # our schema version is too low and can't be handled by the server anymore.
             await self._ws_client.close()
             raise InvalidServerVersion(
-                f"Matter Server schema version is incompatible: {info.schema_version} "
-                f"a version is required that supports at least api schema {MIN_SCHEMA_VERSION} "
-                " - update the Matter Server to a more recent version."
-            )
-        if self.server_info.schema_version > MIN_SCHEMA_VERSION:
-            # server version is higher than expected, log only
-            LOGGER.warning(
-                "Matter Server detected with schema version %s "
-                "which is higher than the preferred api schema %s of this client"
-                " - you may run into compatibility issues.",
-                info.schema_version,
-                MIN_SCHEMA_VERSION,
+                f"Matter schema version is incompatible: {info.schema_version}, "
+                f"the server requires at least {info.min_supported_schema_version} "
+                " - update the Matter client to a more recent version or downgrade the server."
             )
 
         LOGGER.info(
@@ -164,3 +154,16 @@ class MatterClientConnection:
         """Return the representation."""
         prefix = "" if self.connected else "not "
         return f"{type(self).__name__}(ws_server_url={self.ws_server_url!r}, {prefix}connected)"
+
+
+def parse_message(raw: dict) -> MessageType:
+    """Parse Message from raw dict object."""
+    if "event" in raw:
+        return dataclass_from_dict(EventMessage, raw)
+    if "error_code" in raw:
+        return dataclass_from_dict(ErrorResultMessage, raw)
+    if "result" in raw:
+        return dataclass_from_dict(SuccessResultMessage, raw)
+    if "sdk_version" in raw:
+        return dataclass_from_dict(ServerInfoMessage, raw)
+    return dataclass_from_dict(CommandMessage, raw)

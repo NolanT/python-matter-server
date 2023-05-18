@@ -5,11 +5,10 @@ from collections.abc import AsyncGenerator, Generator
 from unittest.mock import MagicMock, patch
 
 import pytest
-from chip.clusters import ClusterCommand
 
-from matter_server.server.server import MatterServer
-from matter_server.common.models.api_command import APICommand
 from matter_server.common.helpers.api import parse_arguments
+from matter_server.common.models import APICommand
+from matter_server.server.server import MatterServer
 
 pytestmark = pytest.mark.usefixtures(
     "application",
@@ -88,6 +87,15 @@ def storage_controller_fixture() -> Generator[MagicMock, None, None]:
         yield storage_controller
 
 
+@pytest.fixture(name="fetch_certificates", autouse=True)
+def fetch_certificates_fixture() -> Generator[MagicMock, None, None]:
+    """Return a mocked fetch certificates."""
+    with patch(
+        "matter_server.server.device_controller.fetch_certificates", autospec=True
+    ) as fetch_certificates:
+        yield fetch_certificates
+
+
 @pytest.fixture(name="server")
 async def server_fixture() -> AsyncGenerator[MatterServer, None]:
     """Yield a server."""
@@ -137,11 +145,11 @@ async def test_server_start(
     assert APICommand.REMOVE_NODE in server.command_handlers
 
     # Check command handler signatures
-    mock_cluster_command = ClusterCommand()
 
     assert not (
         parse_arguments(
             server.command_handlers[APICommand.SERVER_INFO].signature,
+            server.command_handlers[APICommand.SERVER_INFO].type_hints,
             None,
             strict=True,
         )
@@ -149,20 +157,22 @@ async def test_server_start(
     assert not (
         parse_arguments(
             server.command_handlers[APICommand.SERVER_DIAGNOSTICS].signature,
-            None,
-            strict=True,
-        )
-    )
-    assert not (
-        parse_arguments(
-            server.command_handlers[APICommand.GET_NODES].signature,
+            server.command_handlers[APICommand.SERVER_DIAGNOSTICS].type_hints,
             None,
             strict=True,
         )
     )
     assert (
         parse_arguments(
+            server.command_handlers[APICommand.GET_NODES].signature,
+            server.command_handlers[APICommand.GET_NODES].type_hints,
+            strict=True,
+        )
+    ) == {"only_available": False}
+    assert (
+        parse_arguments(
             server.command_handlers[APICommand.GET_NODE].signature,
+            server.command_handlers[APICommand.GET_NODE].type_hints,
             {"node_id": 1},
             strict=True,
         )
@@ -170,6 +180,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.COMMISSION_WITH_CODE].signature,
+            server.command_handlers[APICommand.COMMISSION_WITH_CODE].type_hints,
             {"code": "test_code"},
             strict=True,
         )
@@ -177,6 +188,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.COMMISSION_ON_NETWORK].signature,
+            server.command_handlers[APICommand.COMMISSION_ON_NETWORK].type_hints,
             {"setup_pin_code": 1234},
             strict=True,
         )
@@ -184,6 +196,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.SET_WIFI_CREDENTIALS].signature,
+            server.command_handlers[APICommand.SET_WIFI_CREDENTIALS].type_hints,
             {"ssid": "test_ssid", "credentials": "test_credentials"},
             strict=True,
         )
@@ -191,6 +204,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.SET_THREAD_DATASET].signature,
+            server.command_handlers[APICommand.SET_THREAD_DATASET].type_hints,
             {"dataset": "test_dataset"},
             strict=True,
         )
@@ -198,6 +212,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.OPEN_COMMISSIONING_WINDOW].signature,
+            server.command_handlers[APICommand.OPEN_COMMISSIONING_WINDOW].type_hints,
             {"node_id": 1},
             strict=True,
         )
@@ -211,6 +226,7 @@ async def test_server_start(
     assert not (
         parse_arguments(
             server.command_handlers[APICommand.DISCOVER].signature,
+            server.command_handlers[APICommand.DISCOVER].type_hints,
             None,
             strict=True,
         )
@@ -218,6 +234,7 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.INTERVIEW_NODE].signature,
+            server.command_handlers[APICommand.INTERVIEW_NODE].type_hints,
             {"node_id": 1},
             strict=True,
         )
@@ -225,13 +242,30 @@ async def test_server_start(
     assert (
         parse_arguments(
             server.command_handlers[APICommand.DEVICE_COMMAND].signature,
-            {"node_id": 1, "endpoint": 2, "payload": mock_cluster_command},
+            server.command_handlers[APICommand.DEVICE_COMMAND].type_hints,
+            {
+                "node_id": 1,
+                "endpoint_id": 2,
+                "cluster_id": 0x0006,
+                "command_name": "Off",
+                "payload": {},
+            },
             strict=True,
         )
-    ) == {"node_id": 1, "endpoint": 2, "payload": mock_cluster_command}
+    ) == {
+        "node_id": 1,
+        "endpoint_id": 2,
+        "cluster_id": 0x0006,
+        "command_name": "Off",
+        "payload": {},
+        "response_type": None,
+        "timed_request_timeout_ms": None,
+        "interaction_timeout_ms": None,
+    }
     assert (
         parse_arguments(
             server.command_handlers[APICommand.REMOVE_NODE].signature,
+            server.command_handlers[APICommand.REMOVE_NODE].type_hints,
             {"node_id": 1},
             strict=True,
         )
@@ -242,6 +276,7 @@ async def test_server_start(
     with pytest.raises(KeyError):
         parse_arguments(
             server.command_handlers[APICommand.REMOVE_NODE].signature,
+            server.command_handlers[APICommand.REMOVE_NODE].type_hints,
             {"node_id": 1, "invalid": 2},
             strict=True,
         )

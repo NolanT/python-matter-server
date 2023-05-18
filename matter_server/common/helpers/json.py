@@ -1,5 +1,6 @@
 """Helpers to work with (de)serializing of json."""
 
+from base64 import b64encode
 from dataclasses import is_dataclass
 from typing import Any
 
@@ -23,14 +24,14 @@ def json_encoder_default(obj: Any) -> Any:
         return list(obj)
     if isinstance(obj, float):
         return float(obj)
-    if is_dataclass(obj):
-        return dataclass_to_dict(obj)
     if hasattr(obj, "as_dict"):
         return obj.as_dict()
+    if is_dataclass(obj):
+        return dataclass_to_dict(obj)
     if isinstance(obj, Nullable):
         return None
     if isinstance(obj, bytes):
-        return str(obj)
+        return b64encode(obj).decode("utf-8")
     if isinstance(obj, Exception):
         return str(obj)
     if type(obj) == type:
